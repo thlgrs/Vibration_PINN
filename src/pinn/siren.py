@@ -60,7 +60,7 @@ class SirenNet(nn.Module):
         super().__init__()
         self.n_floors = n_floors
 
-        layers = [SirenLayer(1, hidden_features, omega_0=omega_0, is_first=True)]
+        layers: list[nn.Module] = [SirenLayer(1, hidden_features, omega_0=omega_0, is_first=True)]
         for _ in range(hidden_layers - 1):
             layers.append(
                 SirenLayer(hidden_features, hidden_features, omega_0=omega_0)

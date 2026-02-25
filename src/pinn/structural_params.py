@@ -29,8 +29,10 @@ class StructuralParameters(nn.Module):
     def __init__(self, n_floors, m_prior, k_prior):
         super().__init__()
         self.n_floors = n_floors
-        self.log_m = nn.Parameter(torch.log(torch.tensor(m_prior, dtype=torch.float32)))
-        self.log_k = nn.Parameter(torch.log(torch.tensor(k_prior, dtype=torch.float32)))
+        m0 = torch.as_tensor(m_prior, dtype=torch.float32).clone().detach()
+        k0 = torch.as_tensor(k_prior, dtype=torch.float32).clone().detach()
+        self.log_m = nn.Parameter(torch.log(m0))
+        self.log_k = nn.Parameter(torch.log(k0))
         self.logit_xi = nn.Parameter(torch.tensor(0.0))  # maps to (0, 0.3)
 
     @property

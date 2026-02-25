@@ -5,7 +5,9 @@ Runs PINN-SID with varying noise levels: 0%, 5%, 10%, 15%.
 """
 
 import sys
-sys.path.insert(0, "..")
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def main():

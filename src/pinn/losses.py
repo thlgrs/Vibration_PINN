@@ -10,6 +10,23 @@ Loss functions for PINN structural identification.
 import torch
 
 
+def _time_derivative_per_floor(values, t):
+    """Compute d(values)/dt for each floor independently.
+
+    `torch.autograd.grad` on a matrix output returns a sum-reduced gradient.
+    We need per-floor derivatives, so we differentiate each output column.
+    """
+    grads = []
+    for j in range(values.shape[1]):
+        grad_j = torch.autograd.grad(
+            values[:, j:j + 1], t,
+            grad_outputs=torch.ones_like(values[:, j:j + 1]),
+            create_graph=True, retain_graph=True,
+        )[0]
+        grads.append(grad_j)
+    return torch.cat(grads, dim=1)
+
+
 def data_loss(u_pred, t, a_measured, floor_indices, struct_params, ground_acc_fn):
     """Data fidelity loss: MSE on absolute accelerations at instrumented floors.
 
@@ -33,16 +50,8 @@ def data_loss(u_pred, t, a_measured, floor_indices, struct_params, ground_acc_fn
     loss : Tensor (scalar)
     """
     # Compute predicted accelerations via autograd
-    u_dot = torch.autograd.grad(
-        u_pred, t,
-        grad_outputs=torch.ones_like(u_pred),
-        create_graph=True, retain_graph=True,
-    )[0]
-    u_ddot = torch.autograd.grad(
-        u_dot, t,
-        grad_outputs=torch.ones_like(u_dot),
-        create_graph=True, retain_graph=True,
-    )[0]
+    u_dot = _time_derivative_per_floor(u_pred, t)
+    u_ddot = _time_derivative_per_floor(u_dot, t)
 
     # Absolute acceleration = relative + ground
     ddot_ug = ground_acc_fn(t)
@@ -75,16 +84,8 @@ def physics_loss(t, u_pred, struct_params, ground_acc_fn):
     loss : Tensor (scalar)
     """
     # Velocities and accelerations via autograd
-    u_dot = torch.autograd.grad(
-        u_pred, t,
-        grad_outputs=torch.ones_like(u_pred),
-        create_graph=True, retain_graph=True,
-    )[0]
-    u_ddot = torch.autograd.grad(
-        u_dot, t,
-        grad_outputs=torch.ones_like(u_dot),
-        create_graph=True,
-    )[0]
+    u_dot = _time_derivative_per_floor(u_pred, t)
+    u_ddot = _time_derivative_per_floor(u_dot, t)
 
     M = struct_params.build_M()
     K = struct_params.build_K()
@@ -129,11 +130,7 @@ def ic_loss(model, struct_params):
     t0 = torch.zeros(1, 1, requires_grad=True, device=next(model.parameters()).device)
     u0 = model(t0)
 
-    u_dot_0 = torch.autograd.grad(
-        u0, t0,
-        grad_outputs=torch.ones_like(u0),
-        create_graph=True,
-    )[0]
+    u_dot_0 = _time_derivative_per_floor(u0, t0)
 
     return torch.mean(u0**2) + torch.mean(u_dot_0**2)
 
