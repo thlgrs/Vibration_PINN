@@ -150,8 +150,6 @@ def main():
             "Stiffness (N/m)",
             save_path=str(stiff_path),
         )
-        loss_fig.show()
-        param_fig.show()
         print(f"Saved plots:\n- {loss_path}\n- {stiff_path}")
 
 
