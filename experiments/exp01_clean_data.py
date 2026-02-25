@@ -131,7 +131,7 @@ def main():
     print(f"Stiffnesses: {struct_params.k.detach().cpu().numpy()}")
     print(f"True stiff.: {true_k}")
     print(f"Damping:     {struct_params.xi.detach().cpu().item():.4f}")
-    print(f"True damp.:  0.05")
+    print("True damp.:  0.05")
 
     # Save plots
     if not args.skip_plots:
