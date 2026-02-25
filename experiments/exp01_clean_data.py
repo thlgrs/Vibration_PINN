@@ -100,7 +100,9 @@ def main():
         hidden_features=args.hidden_features,
         hidden_layers=args.hidden_layers,
     ).to(device)
-    struct_params = StructuralParameters(n_floors, m_prior.cpu(), k_prior.cpu()).to(device)
+    struct_params = StructuralParameters(n_floors, m_prior.cpu(), k_prior.cpu()).to(
+        device
+    )
 
     # All floors instrumented
     floor_indices = list(range(n_floors))
@@ -141,13 +143,15 @@ def main():
 
         loss_path = results_dir / "exp01_loss.png"
         stiff_path = results_dir / "exp01_stiffness.png"
-        plot_loss_history(history, save_path=str(loss_path))
-        plot_parameter_convergence(
+        loss_fig, loss_ax = plot_loss_history(history, save_path=str(loss_path))
+        param_fig, param_ax = plot_parameter_convergence(
             history["stiffnesses"],
             true_k,
             "Stiffness (N/m)",
             save_path=str(stiff_path),
         )
+        loss_fig.show()
+        param_fig.show()
         print(f"Saved plots:\n- {loss_path}\n- {stiff_path}")
 
 
