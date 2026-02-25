@@ -1,0 +1,748 @@
+# PRD — Physics-Informed Neural Network for Structural Identification from Vibration Data
+
+**Project codename:** PINN-SID  
+**Version:** 1.0  
+**Author:** Théo Legros  
+**Date:** 2026  
+**Status:** Planning
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [Problem Statement](#2-problem-statement)
+3. [Scientific and Theoretical Background](#3-scientific-and-theoretical-background)
+4. [Technical Approach](#4-technical-approach)
+5. [Implementation Plan](#5-implementation-plan)
+6. [Validation Strategy](#6-validation-strategy)
+7. [Repository Structure](#7-repository-structure)
+8. [Deliverables and Success Metrics](#8-deliverables-and-success-metrics)
+9. [References](#9-references)
+
+---
+
+## 1. Executive Summary
+
+### 1.1 One-Line Description
+
+A Physics-Informed Neural Network (PINN) that identifies the mass, stiffness, and damping parameters of a multi-story building structure from sparse, noisy floor acceleration measurements — simultaneously fitting sensor data and satisfying the equations of structural dynamics.
+
+### 1.2 Motivation
+
+Structural Health Monitoring (SHM) is the process of continuously assessing the integrity of a structure through in-situ sensor measurements. A central task in SHM is **structural identification (SID)**: inferring the physical parameters of the structure from its measured dynamic response. Changes in identified stiffness over time indicate damage accumulation, deterioration, or post-earthquake degradation.
+
+Classical system identification methods (e.g. ERA, SSI, frequency domain decomposition) extract modal parameters (frequencies, mode shapes, damping ratios) from output-only measurements but do not directly recover physical parameters ($m_i$, $k_i$, $\xi_i$). Converting modal parameters to physical parameters requires solving an inverse eigenvalue problem, which is ill-conditioned for large structures.
+
+PINNs offer a fundamentally different approach: by embedding the **equations of motion** directly into the training loss, the network simultaneously reconstructs the displacement/acceleration time history and identifies the physical parameters as trainable variables — no modal decomposition step required.
+
+### 1.3 Relevance to Target Roles
+
+| Competency demonstrated | Relevant for |
+|---|---|
+| PyTorch `autograd` for physics-based training | CSI (TensorFlow, PyTorch required) |
+| Structural dynamics theory | Both CSI and ALLPLAN/SCIA |
+| Inverse problem formulation | CSI (surrogate modeling, predictive analysis) |
+| Time-series data processing | CSI (seismic surrogate complement) |
+| SHM application | Industry-relevant engineering context |
+
+---
+
+## 2. Problem Statement
+
+### 2.1 Engineering Context
+
+Consider an $n$-story shear building subjected to a ground motion $\ddot{u}_g(t)$ or ambient vibration excitation. Accelerometers are installed at selected floors and record the **absolute acceleration** $\ddot{u}_i^{abs}(t)$ at floor $i$. The sensors are:
+
+- **Sparse**: not every floor is instrumented (typically $k \ll n$ sensors for $n$ floors)
+- **Noisy**: measurement noise of amplitude 5–15% of peak signal
+- **Incomplete**: only accelerations are measured — not displacements or velocities
+
+**Goal:** Given the measured acceleration time histories $\{\ddot{u}_i^{abs}(t)\}_{i \in \mathcal{S}}$ at the instrumented floors $\mathcal{S}$, and the ground acceleration record $\ddot{u}_g(t)$, identify:
+
+- Story masses $m_i$, $i = 1, \ldots, n$
+- Story stiffnesses $k_i$, $i = 1, \ldots, n$
+- Modal damping ratios $\xi$ (assumed proportional damping)
+
+### 2.2 Why This Is Hard for Classical Methods
+
+**Classical output-only methods** (ERA, SSI, FDD) work in the frequency domain or using correlation functions. They identify **modal parameters** $(\omega_r, \phi_r, \xi_r)$ but:
+
+- Require long data records (stationary excitation assumption)
+- The conversion from modal to physical parameters is ill-conditioned without full instrumentation
+- Cannot handle time-varying parameters (progressive damage) easily
+- The mass matrix must be known independently
+
+**Classical input-output methods** (subspace methods, ARX models) require the ground motion as input, which is available for earthquake monitoring but not ambient vibration. They do not directly produce physically interpretable parameters.
+
+**PINNs address these limitations** by:
+
+- Directly identifying physical parameters ($m_i$, $k_i$, $\xi_i$) as learnable variables
+- Requiring no assumption on stationarity of excitation
+- Working with sparse sensor layouts through interpolation of unobserved DOFs
+- Being extensible to time-varying parameters by treating $k_i(t)$ as a function approximated by a sub-network
+
+### 2.3 Scope
+
+**In scope (v1.0):**
+- Linear shear building, $n = 3$–$6$ stories
+- Known ground excitation (earthquake or chirp signal)
+- Proportional Rayleigh damping
+- Identification of $[m_i, k_i, \xi]$
+- Synthetic data generated by numerical simulation
+
+**Out of scope (v1.0, potential extensions):**
+- Nonlinear material behavior
+- Real sensor data from physical buildings
+- Output-only identification (unknown excitation)
+- Structural damage localization beyond stiffness reduction detection
+
+---
+
+## 3. Scientific and Theoretical Background
+
+### 3.1 Equations of Motion — Shear Building Model
+
+A shear building is a lumped-parameter model where the mass of each floor is concentrated at the slab level and the columns provide lateral stiffness. The model assumes:
+
+- Floors are rigid in-plane (no shear deformation of slabs)
+- Columns are axially rigid and provide lateral stiffness $k_i$ (story stiffness)
+- Mass $m_i$ is lumped at each floor
+
+The equation of motion for the full $n$-DOF system under ground excitation is:
+
+$$\mathbf{M}\ddot{\mathbf{u}}(t) + \mathbf{C}\dot{\mathbf{u}}(t) + \mathbf{K}\mathbf{u}(t) = -\mathbf{M}\boldsymbol{\iota}\ddot{u}_g(t)$$
+
+where:
+- $\mathbf{u}(t) \in \mathbb{R}^n$ is the vector of **relative floor displacements** (relative to ground)
+- $\mathbf{M} = \text{diag}(m_1, m_2, \ldots, m_n)$ is the **diagonal mass matrix**
+- $\boldsymbol{\iota} = [1, 1, \ldots, 1]^T$ is the **influence vector**
+- $\ddot{u}_g(t)$ is the ground acceleration
+
+The **tridiagonal stiffness matrix** for a shear building is:
+
+$$\mathbf{K} = \begin{bmatrix}
+k_1 + k_2 & -k_2 & 0 & \cdots \\
+-k_2 & k_2 + k_3 & -k_3 & \cdots \\
+0 & -k_3 & k_3 + k_4 & \cdots \\
+\vdots & & & \ddots
+\end{bmatrix}$$
+
+### 3.2 Rayleigh Damping
+
+Damping is modeled through **proportional (Rayleigh) damping**:
+
+$$\mathbf{C} = \alpha \mathbf{M} + \beta \mathbf{K}$$
+
+The coefficients $\alpha$ and $\beta$ are related to the damping ratio $\xi$ at two target frequencies $\omega_i$ and $\omega_j$:
+
+$$\alpha = \frac{2\xi\omega_i\omega_j}{\omega_i + \omega_j}, \qquad \beta = \frac{2\xi}{\omega_i + \omega_j}$$
+
+In practice, $\omega_1$ (fundamental) and $\omega_3$ (third mode) are used as target frequencies. The damping ratio $\xi$ is treated as a **single scalar trainable parameter** shared across all modes.
+
+### 3.3 Modal Analysis — Eigenvalue Problem
+
+The natural frequencies and mode shapes are found from the generalized eigenvalue problem:
+
+$$\mathbf{K}\boldsymbol{\phi}_r = \omega_r^2 \mathbf{M}\boldsymbol{\phi}_r, \qquad r = 1, \ldots, n$$
+
+The angular frequencies $\omega_r$ (rad/s) relate to natural frequencies $f_r$ (Hz) and periods $T_r$ (s):
+
+$$f_r = \frac{\omega_r}{2\pi}, \qquad T_r = \frac{1}{f_r}$$
+
+Mode shapes are mass-normalized:
+
+$$\boldsymbol{\phi}_r^T \mathbf{M} \boldsymbol{\phi}_r = 1$$
+
+The identified $[m_i, k_i]$ can be validated by computing the resulting natural frequencies and comparing to those extracted independently by classical methods (FFT peak-picking).
+
+### 3.4 Newmark-$\beta$ Time Integration (Reference Solver)
+
+To generate synthetic training data, the equations of motion are integrated using the **Newmark constant average acceleration scheme** ($\gamma = 1/2$, $\beta = 1/4$), which is unconditionally stable for linear systems:
+
+$$\mathbf{u}_{n+1} = \mathbf{u}_n + \Delta t\,\dot{\mathbf{u}}_n + \Delta t^2\left[\left(\frac{1}{2}-\beta\right)\ddot{\mathbf{u}}_n + \beta\,\ddot{\mathbf{u}}_{n+1}\right]$$
+
+$$\dot{\mathbf{u}}_{n+1} = \dot{\mathbf{u}}_n + \Delta t\left[(1-\gamma)\ddot{\mathbf{u}}_n + \gamma\,\ddot{\mathbf{u}}_{n+1}\right]$$
+
+The effective stiffness matrix is:
+
+$$\mathbf{K}_{eff} = \mathbf{K} + \frac{\gamma}{\beta\Delta t}\mathbf{C} + \frac{1}{\beta\Delta t^2}\mathbf{M}$$
+
+At each time step, one linear system solve is required:
+$$\mathbf{K}_{eff}\,\mathbf{u}_{n+1} = \mathbf{f}_{eff,n+1}$$
+
+This solver is implemented in pure NumPy and serves as the **ground truth generator**.
+
+### 3.5 Physics-Informed Neural Networks — Foundations
+
+PINNs were introduced by Raissi, Perdikaris, and Karniadakis (2019) as a framework for solving forward and inverse problems governed by PDEs using neural networks. The key insight is that **automatic differentiation** allows computing exact derivatives of the network output with respect to its inputs, enabling the residual of any differential equation to be computed and minimized during training.
+
+For a general initial value problem:
+
+$$\mathcal{N}[\mathbf{u}(t);\,\boldsymbol{\lambda}] = 0, \quad t \in [0, T]$$
+$$\mathbf{u}(0) = \mathbf{u}_0, \quad \dot{\mathbf{u}}(0) = \dot{\mathbf{u}}_0$$
+
+where $\boldsymbol{\lambda}$ are unknown system parameters, a PINN:
+
+1. Approximates $\mathbf{u}(t) \approx f_\theta(t)$ with a neural network
+2. Computes $\dot{\mathbf{u}}$ and $\ddot{\mathbf{u}}$ via `torch.autograd.grad`
+3. Minimizes a combined loss over the PDE residual, initial conditions, and observed data
+4. Treats $\boldsymbol{\lambda}$ as **additional trainable parameters** alongside the network weights $\theta$
+
+This simultaneous optimization of $[\theta, \boldsymbol{\lambda}]$ is the mechanism through which parameter identification occurs.
+
+### 3.6 PINN Formulation for Structural Identification
+
+The network $f_\theta: \mathbb{R} \rightarrow \mathbb{R}^n$ maps time $t$ to the floor displacement vector $\hat{\mathbf{u}}(t)$.
+
+The **total loss** has four components:
+
+#### 3.6.1 Data Loss
+
+Penalizes deviation from sensor measurements. Sensors record **absolute acceleration** $\ddot{u}_i^{abs} = \ddot{u}_i + \ddot{u}_g$, so:
+
+$$\mathcal{L}_{data} = \frac{1}{|\mathcal{S}|N_d}\sum_{i \in \mathcal{S}}\sum_{j=1}^{N_d}\left(\hat{\ddot{u}}_i(t_j) + \ddot{u}_g(t_j) - \ddot{u}_i^{meas}(t_j)\right)^2$$
+
+where $\mathcal{S}$ is the set of instrumented floors, $\hat{\ddot{u}}_i$ is computed by differentiating $f_\theta$ twice with respect to $t$.
+
+#### 3.6.2 Physics Residual Loss
+
+Enforces the equations of motion at $N_c$ collocation points:
+
+$$\mathcal{L}_{phys} = \frac{1}{nN_c}\sum_{j=1}^{N_c}\left\|\mathbf{M}\hat{\ddot{\mathbf{u}}}(t_j) + \mathbf{C}\hat{\dot{\mathbf{u}}}(t_j) + \mathbf{K}\hat{\mathbf{u}}(t_j) + \mathbf{M}\boldsymbol{\iota}\ddot{u}_g(t_j)\right\|^2$$
+
+where $\mathbf{M}$, $\mathbf{C}(\xi)$, $\mathbf{K}$ are assembled from the trainable parameters $[m_i, k_i, \xi]$.
+
+#### 3.6.3 Initial Condition Loss
+
+Enforces zero displacement and velocity at $t = 0$ (structure at rest before excitation):
+
+$$\mathcal{L}_{ic} = \left\|\hat{\mathbf{u}}(0)\right\|^2 + \left\|\hat{\dot{\mathbf{u}}}(0)\right\|^2$$
+
+#### 3.6.4 Physical Constraint Loss (Regularization)
+
+Prevents physically inadmissible parameter values (negative mass or stiffness):
+
+$$\mathcal{L}_{reg} = \sum_{i=1}^{n}\max(0, -m_i)^2 + \sum_{i=1}^{n}\max(0, -k_i)^2 + \max(0, -\xi)^2 + \max(0, \xi - 0.5)^2$$
+
+#### 3.6.5 Total Loss
+
+$$\mathcal{L}_{total} = \lambda_{data}\mathcal{L}_{data} + \lambda_{phys}\mathcal{L}_{phys} + \lambda_{ic}\mathcal{L}_{ic} + \lambda_{reg}\mathcal{L}_{reg}$$
+
+Loss weights $[\lambda_{data}, \lambda_{phys}, \lambda_{ic}, \lambda_{reg}]$ require careful tuning — this is a known challenge in PINN training. A practical starting point is $[1, 1, 10, 100]$, with the IC and regularization weighted heavily to ensure physically valid solutions from the start.
+
+### 3.7 Automatic Differentiation in PyTorch
+
+The derivatives of the network output with respect to its input are computed exactly (up to floating-point precision) via reverse-mode automatic differentiation. In PyTorch:
+
+```python
+t = torch.tensor(t_data, requires_grad=True)
+u_pred = model(t)               # shape: (N, n_floors)
+
+# First derivative: velocity
+u_dot = torch.autograd.grad(
+    u_pred, t,
+    grad_outputs=torch.ones_like(u_pred),
+    create_graph=True   # needed for second derivative
+)[0]
+
+# Second derivative: acceleration
+u_ddot = torch.autograd.grad(
+    u_dot, t,
+    grad_outputs=torch.ones_like(u_dot),
+    create_graph=True
+)[0]
+```
+
+The `create_graph=True` flag is essential — it builds a computational graph through the gradient operation itself, allowing gradients of gradients to be computed during backpropagation. Without it, $\mathcal{L}_{phys}$ cannot be differentiated with respect to $\theta$.
+
+### 3.8 Known Challenges in PINN Training
+
+#### Loss imbalance
+Different loss terms operate at very different scales. For example, $\mathcal{L}_{data}$ involves accelerations in m/s², while $\mathcal{L}_{phys}$ involves force residuals in N. Without normalization, the optimizer neglects the smaller loss terms. Mitigation: normalize all quantities to dimensionless form before training.
+
+#### Spectral bias
+Standard MLPs with ReLU activation preferentially learn low-frequency components of the target function (Rahaman et al., 2019). For structural dynamics, the response contains multiple frequencies simultaneously. Mitigation: use **sinusoidal activation functions** (Siren network, Sitzmann et al., 2020) or **Fourier feature embeddings** of the time input.
+
+#### Causality in time integration
+PINNs do not inherently respect the causal direction of time — the physics residual at $t = 10$ s is weighted equally to the residual at $t = 0.1$ s during training, even though errors at early times propagate to all later times. For long time domains this causes training failure. Mitigation: **causal training** (Wang et al., 2022) weights the physics loss at time $t_j$ by $e^{-\epsilon \mathcal{L}_{phys}(t < t_j)}$, ensuring the network learns early time behavior before attempting later times.
+
+#### Identifiability
+If mass and stiffness are both unknown, the system may not be uniquely identifiable from acceleration data alone. This is a fundamental limitation: only the **frequency ratio** $k/m$ is observable in undamped free vibration, not $k$ and $m$ independently. Mitigation: assume masses are known (common in practice — estimated from structural drawings) and identify stiffnesses only. This is the most practically relevant scenario (post-earthquake stiffness assessment).
+
+---
+
+## 4. Technical Approach
+
+### 4.1 Architecture — Siren Network
+
+Standard MLPs with ReLU activation suffer from **spectral bias** for oscillatory responses (Rahaman et al., 2019). The structural response $\mathbf{u}(t)$ is quasi-periodic, making this particularly problematic.
+
+The **Siren** (Sinusoidal Representation Network, Sitzmann et al., 2020) uses $\sin$ activations throughout:
+
+$$\phi_l(\mathbf{x}) = \sin(\mathbf{W}_l \phi_{l-1}(\mathbf{x}) + \mathbf{b}_l)$$
+
+with a specific initialization scheme: $\mathbf{W}_l \sim \mathcal{U}\left(-\sqrt{6/n_{in}},\, \sqrt{6/n_{in}}\right)$ for hidden layers, and the first layer scaled by $\omega_0 = 30$ (a hyperparameter controlling the frequency content of the network).
+
+```python
+import torch
+import torch.nn as nn
+import numpy as np
+
+class SirenLayer(nn.Module):
+    def __init__(self, in_features, out_features, omega_0=30.0,
+                 is_first=False):
+        super().__init__()
+        self.linear   = nn.Linear(in_features, out_features)
+        self.omega_0  = omega_0
+        self.is_first = is_first
+        self._init_weights()
+
+    def _init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features,
+                                             1 / self.in_features)
+            else:
+                n = self.linear.weight.shape[1]
+                self.linear.weight.uniform_(-np.sqrt(6 / n) / self.omega_0,
+                                             np.sqrt(6 / n) / self.omega_0)
+
+    def forward(self, x):
+        return torch.sin(self.omega_0 * self.linear(x))
+
+class SirenNet(nn.Module):
+    """
+    Siren network mapping t -> u(t) for n_floors DOFs.
+    Input:  t  (N, 1) — normalized time
+    Output: u  (N, n_floors) — relative floor displacements
+    """
+    def __init__(self, n_floors, hidden_features=128, hidden_layers=4,
+                 omega_0=30.0):
+        super().__init__()
+        self.n_floors = n_floors
+        layers = [SirenLayer(1, hidden_features,
+                             omega_0=omega_0, is_first=True)]
+        for _ in range(hidden_layers - 1):
+            layers.append(SirenLayer(hidden_features, hidden_features,
+                                     omega_0=omega_0))
+        layers.append(nn.Linear(hidden_features, n_floors))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, t):
+        return self.net(t)
+```
+
+### 4.2 Trainable Structural Parameters
+
+The structural parameters are declared as `nn.Parameter` objects within a dedicated module, optimized jointly with the network weights:
+
+```python
+class StructuralParameters(nn.Module):
+    def __init__(self, n_floors, m_prior, k_prior):
+        """
+        m_prior, k_prior: initial estimates (e.g. from design drawings)
+        Parameters are stored in log-space to enforce positivity.
+        """
+        super().__init__()
+        self.log_m = nn.Parameter(torch.log(torch.tensor(m_prior)))
+        self.log_k = nn.Parameter(torch.log(torch.tensor(k_prior)))
+        self.logit_xi = nn.Parameter(torch.tensor(0.0))  # maps to (0,1)
+
+    @property
+    def m(self):
+        return torch.exp(self.log_m)   # always positive
+
+    @property
+    def k(self):
+        return torch.exp(self.log_k)   # always positive
+
+    @property
+    def xi(self):
+        return 0.3 * torch.sigmoid(self.logit_xi)  # bounded in (0, 0.3)
+
+    def build_K(self):
+        k = self.k
+        n = len(k)
+        K = torch.zeros(n, n)
+        for i in range(n):
+            K[i, i] += k[i]
+            if i > 0:
+                K[i, i]   += k[i-1]
+                K[i, i-1] -= k[i-1]
+                K[i-1, i] -= k[i-1]
+        return K
+
+    def build_M(self):
+        return torch.diag(self.m)
+
+    def build_C(self, omega1, omega3):
+        alpha = 2*self.xi*omega1*omega3 / (omega1 + omega3)
+        beta  = 2*self.xi / (omega1 + omega3)
+        return alpha * self.build_M() + beta * self.build_K()
+```
+
+**Reparameterization trick:** storing parameters in log-space (masses and stiffnesses) and logit-space (damping ratio) ensures positivity and boundedness without explicit projection — the optimizer operates in unconstrained space. This is significantly more stable than applying `torch.clamp` after each gradient step.
+
+### 4.3 Physics Loss Assembly
+
+```python
+def physics_residual(t, u_pred, struct_params, ground_acc_fn):
+    """
+    Compute the equation of motion residual at collocation points.
+    t:            (N_c, 1) tensor with requires_grad=True
+    u_pred:       (N_c, n_floors) network output
+    ground_acc_fn: callable, returns ddot_ug at time t
+    """
+    # Compute velocities and accelerations via autograd
+    u_dot = torch.autograd.grad(
+        u_pred, t,
+        grad_outputs=torch.ones_like(u_pred),
+        create_graph=True, retain_graph=True
+    )[0]
+
+    u_ddot = torch.autograd.grad(
+        u_dot, t,
+        grad_outputs=torch.ones_like(u_dot),
+        create_graph=True
+    )[0]
+
+    M = struct_params.build_M()
+    K = struct_params.build_K()
+
+    # Estimate omega1, omega3 from current K, M for Rayleigh damping
+    with torch.no_grad():
+        eigvals = torch.linalg.eigvalsh(
+            torch.linalg.solve(M, K)
+        )
+        omega1 = eigvals[0].sqrt()
+        omega3 = eigvals[min(2, len(eigvals)-1)].sqrt()
+
+    C = struct_params.build_C(omega1, omega3)
+
+    # Ground excitation influence vector
+    iota = torch.ones(struct_params.n_floors, 1)
+    ddot_ug = ground_acc_fn(t)  # (N_c, 1)
+
+    # EOM residual: M*u_ddot + C*u_dot + K*u + M*iota*ddot_ug = 0
+    residual = (u_ddot @ M.T
+              + u_dot  @ C.T
+              + u_pred @ K.T
+              + ddot_ug * (M @ iota).T)
+
+    return (residual ** 2).mean()
+```
+
+### 4.4 Training Strategy — Causal Weighting
+
+To address the causality problem for long time sequences, adopt the causal training scheme of Wang et al. (2022). Time collocation points are ordered $t_1 < t_2 < \ldots < t_{N_c}$ and the physics loss at $t_j$ is weighted by accumulated early-time residuals:
+
+$$\mathcal{L}_{phys} = \sum_{j=1}^{N_c} w_j \cdot r_j^2, \qquad w_j = \exp\left(-\epsilon \sum_{l=1}^{j-1} r_l^2\right)$$
+
+where $r_j$ is the EOM residual at $t_j$ and $\epsilon > 0$ is a hyperparameter (typically $\epsilon = 1$–$10$). Early time steps have weight $\approx 1$; later time steps have low weight until the early-time physics is well satisfied.
+
+```python
+def causal_physics_loss(residuals_ordered, epsilon=1.0):
+    """
+    residuals_ordered: (N_c, n_floors) tensor, ordered by time
+    """
+    r_sq = (residuals_ordered ** 2).mean(dim=1)  # (N_c,)
+    cumulative = torch.cumsum(r_sq, dim=0)
+    weights = torch.exp(-epsilon * torch.roll(cumulative, 1))
+    weights[0] = 1.0
+    return (weights * r_sq).mean()
+```
+
+### 4.5 Two-Phase Training Protocol
+
+Training directly on the full loss is unstable — the physics loss is meaningless if the network first predicts reasonable displacements. A two-phase protocol is used:
+
+**Phase 1 — Warm-up (500 epochs):** Train on $\mathcal{L}_{data} + \mathcal{L}_{ic}$ only with $\lambda_{phys} = 0$. This gives the network a good initial displacement estimate before the physics constraint is activated. Structural parameters are also optimized in this phase through the data loss (acceleration consistency).
+
+**Phase 2 — Full training (3000 epochs):** Activate all loss terms. Start with $\lambda_{phys}$ small (0.01) and increase it gradually (curriculum learning on the physics weight). This prevents the physics loss from destabilizing the network before it has a reasonable solution.
+
+```python
+optimizer_net    = torch.optim.Adam(model.parameters(), lr=1e-4)
+optimizer_params = torch.optim.Adam(struct_params.parameters(), lr=1e-3)
+
+# Phase 1: warm-up on data only
+for epoch in range(500):
+    loss = lambda_data * data_loss() + lambda_ic * ic_loss()
+    optimizer_net.zero_grad(); optimizer_params.zero_grad()
+    loss.backward()
+    optimizer_net.step(); optimizer_params.step()
+
+# Phase 2: full physics-constrained training
+lambda_phys_schedule = np.logspace(-2, 0, 3000)  # 0.01 → 1.0
+
+for epoch in range(3000):
+    lp = float(lambda_phys_schedule[epoch])
+    loss = (lambda_data * data_loss()
+          + lp          * physics_loss()
+          + lambda_ic   * ic_loss()
+          + lambda_reg  * reg_loss())
+    optimizer_net.zero_grad(); optimizer_params.zero_grad()
+    loss.backward()
+    optimizer_net.step(); optimizer_params.step()
+```
+
+---
+
+## 5. Implementation Plan
+
+### Phase 1 — Reference Solver and Synthetic Data Generation (Week 1)
+
+**Goal:** Build a clean NumPy-based Newmark solver and generate synthetic datasets.
+
+Tasks:
+- Implement `ShearBuilding` class with configurable $[m_i, k_i, \xi]$
+- Implement `NewmarkSolver` with constant average acceleration ($\gamma = 0.5$, $\beta = 0.25$)
+- Ground motion inputs: El Centro 1940 (historic), chirp signal (controlled frequency sweep), white noise (broadband)
+- Generate absolute floor accelerations, add Gaussian noise ($\sigma = 5\%$ and $15\%$ of peak)
+- Implement `modal_analysis()` using `scipy.linalg.eigh` for ground truth frequencies
+
+**Reference structure (3-story, well-studied in literature):**
+
+| Parameter | Floor 1 | Floor 2 | Floor 3 |
+|---|---|---|---|
+| Mass $m_i$ (kg) | 5000 | 5000 | 5000 |
+| Story stiffness $k_i$ (kN/m) | 8000 | 6000 | 4000 |
+| Damping ratio $\xi$ | 5% | 5% | 5% |
+
+Expected fundamental period: $T_1 \approx 0.32$ s. This is consistent with a 3-story RC building (EC8 empirical formula: $T_1 = C_T H^{3/4} \approx 0.075 \times 9^{0.75} \approx 0.37$ s).
+
+**Deliverable:** `data_generation.py` producing `synthetic_response.npz` containing time vector, ground acceleration, floor accelerations (clean + noisy), and true parameter values.
+
+---
+
+### Phase 2 — PINN Infrastructure (Week 2)
+
+**Goal:** Build all PyTorch components before attempting full training.
+
+Tasks:
+- Implement `SirenNet` with proper initialization (Sitzmann et al., 2020 initialization scheme)
+- Implement `StructuralParameters` module with reparameterized positive constraints
+- Implement `physics_residual()` function using `torch.autograd.grad` (two nested calls)
+- Implement `causal_physics_loss()` with exponential weighting
+- Unit test each component independently:
+  - Verify Siren forward pass produces bounded outputs
+  - Verify `physics_residual()` returns zero when fed exact Newmark solution
+  - Verify gradient flow through `StructuralParameters`
+
+**Critical test:** Feed the exact Newmark solution $\mathbf{u}^{exact}(t)$ as a piecewise linear interpolation, compute the physics residual — it should be small but non-zero due to time discretization. This establishes a numerical floor for the physics loss.
+
+---
+
+### Phase 3 — Training and Hyperparameter Tuning (Week 3)
+
+**Goal:** Successfully identify structural parameters on the clean data case.
+
+Training configuration:
+
+| Hyperparameter | Value |
+|---|---|
+| Network: hidden layers | 4 |
+| Network: hidden features | 128 |
+| Siren $\omega_0$ | 30 |
+| Collocation points $N_c$ | 2000 (randomly sampled in $[0, T]$) |
+| Data points $N_d$ | 500 (every 6th time step from $\Delta t = 0.01$ s) |
+| Optimizer | Adam |
+| LR (network) | $10^{-4}$ |
+| LR (structural params) | $10^{-3}$ |
+| Phase 1 epochs | 500 |
+| Phase 2 epochs | 3000 |
+| Causal $\epsilon$ | 1.0 |
+
+**Sensor configurations to test** (key experiment for showing sparse sensor performance):
+
+| Config | Instrumented floors | Identification difficulty |
+|---|---|---|
+| Full | 1, 2, 3 | Easiest |
+| Partial-2 | 1, 3 | Medium |
+| Partial-1 | 3 only (roof) | Hardest |
+
+---
+
+### Phase 4 — Damage Detection Extension (Week 4)
+
+**Goal:** Demonstrate practical SHM application by detecting a stiffness reduction.
+
+Simulate a **damaged structure** where story stiffness $k_2$ is reduced by 30% (representing post-earthquake damage at the second story):
+
+$$k_2^{damaged} = 0.70 \times k_2^{undamaged}$$
+
+Run the PINN identification on:
+1. Pre-event response → identify $k_i^{before}$
+2. Post-event response → identify $k_i^{after}$
+
+Compute the **stiffness reduction index**:
+
+$$\Delta k_i = \frac{k_i^{before} - k_i^{after}}{k_i^{before}} \times 100\%$$
+
+A value of $\Delta k_2 \approx 30\%$ with $\Delta k_1 \approx 0\%$ and $\Delta k_3 \approx 0\%$ confirms correct damage localization. This is the primary **engineering result** of the project — showing that the method can locate and quantify damage from acceleration data alone.
+
+---
+
+### Phase 5 — Sensitivity Analysis and Documentation (Week 5)
+
+**Goal:** Characterize method robustness and produce final results.
+
+Experiments:
+- Effect of noise level: $\sigma \in \{0\%, 5\%, 10\%, 15\%\}$ — show identification error vs. noise
+- Effect of sensor count: full vs. partial instrumentation
+- Effect of excitation type: El Centro vs. chirp vs. white noise
+- Effect of initial parameter guess: start from $\pm 30\%$ of true values
+
+For each condition, run 10 independent training trials (different random seeds) and report mean ± standard deviation of identified parameters. This assesses **robustness** — a critical concern for any SHM method intended for real deployment.
+
+---
+
+## 6. Validation Strategy
+
+### 6.1 Parameter Identification Error
+
+For each structural parameter, compute the **relative identification error**:
+
+$$e_i = \frac{|\hat{\lambda}_i - \lambda_i^{true}|}{\lambda_i^{true}} \times 100\%$$
+
+Target accuracy: $e_i < 5\%$ for stiffness identification under 5% noise with full instrumentation.
+
+### 6.2 Frequency Consistency Check
+
+From the identified $[\hat{m}_i, \hat{k}_i]$, compute natural frequencies via eigenvalue analysis and compare to FFT-estimated frequencies from the acceleration signal:
+
+$$\hat{f}_r = \frac{1}{2\pi}\sqrt{\hat{\omega}_r^2}, \qquad f_r^{FFT} = \text{peak frequency in }|\hat{U}_r(f)|^2$$
+
+This provides an **independent validation** that does not depend on knowing the true parameters.
+
+### 6.3 Response Reconstruction Quality
+
+Compare the PINN-reconstructed displacement time history at uninstrumented floors against the Newmark ground truth:
+
+$$\text{NRMSE}_i = \frac{\sqrt{\frac{1}{T}\int_0^T(\hat{u}_i(t) - u_i^{true}(t))^2\,dt}}{\max|u_i^{true}(t)|}$$
+
+Target: NRMSE $< 5\%$ at instrumented floors, $< 15\%$ at uninstrumented floors.
+
+### 6.4 Comparison with Classical Method (ERA)
+
+Implement the **Eigensystem Realization Algorithm (ERA)** (Juang & Pappa, 1985) as a classical baseline. Compare identified frequencies and mode shapes between PINN-SID and ERA. The comparison should show:
+
+- ERA identifies modal parameters accurately but cannot directly identify $[m_i, k_i]$
+- PINN-SID identifies physical parameters directly, enabling damage quantification without a separate inverse eigenvalue step
+
+---
+
+## 7. Repository Structure
+
+```
+pinn-structural-identification/
+├── README.md
+├── requirements.txt                  # torch, numpy, scipy, matplotlib, h5py
+├── docs/
+│   ├── theory.md                     # Equations of motion, PINN formulation
+│   ├── architecture.md               # Siren network, reparameterization
+│   └── results_summary.md            # Key findings and figures
+├── src/
+│   ├── structures/
+│   │   ├── shear_building.py         # ShearBuilding class: K, M, C assembly
+│   │   ├── newmark_solver.py         # Reference time integration
+│   │   └── modal_analysis.py         # Eigenvalue solver, natural frequencies
+│   ├── data/
+│   │   ├── generate_synthetic.py     # Dataset generation pipeline
+│   │   ├── ground_motions/           # El Centro, chirp, white noise records
+│   │   └── add_noise.py              # Gaussian noise addition + SNR computation
+│   ├── pinn/
+│   │   ├── siren.py                  # SirenLayer, SirenNet
+│   │   ├── structural_params.py      # StructuralParameters module
+│   │   ├── losses.py                 # data_loss, physics_loss, ic_loss, reg_loss
+│   │   ├── causal_weighting.py       # Causal loss scheduler (Wang et al. 2022)
+│   │   └── trainer.py                # Two-phase training loop
+│   ├── baselines/
+│   │   └── era.py                    # Eigensystem Realization Algorithm
+│   └── utils/
+│       ├── metrics.py                # NRMSE, relative error, frequency error
+│       └── plotting.py               # Time history plots, parameter convergence
+├── experiments/
+│   ├── exp01_clean_data.py           # Full sensor, no noise
+│   ├── exp02_noisy_data.py           # Noise sensitivity study
+│   ├── exp03_sparse_sensors.py       # Partial instrumentation
+│   ├── exp04_damage_detection.py     # Pre/post damage identification
+│   └── exp05_era_comparison.py       # Classical vs PINN benchmark
+├── notebooks/
+│   ├── 01_newmark_verification.ipynb
+│   ├── 02_siren_vs_relu.ipynb        # Spectral bias demonstration
+│   ├── 03_training_convergence.ipynb
+│   ├── 04_parameter_identification.ipynb
+│   └── 05_damage_detection.ipynb
+└── results/
+    ├── parameter_convergence/
+    ├── time_history_reconstruction/
+    ├── damage_detection/
+    └── era_comparison/
+```
+
+---
+
+## 8. Deliverables and Success Metrics
+
+### 8.1 Core Deliverables
+
+| Deliverable | Description |
+|---|---|
+| Newmark reference solver | Clean NumPy implementation, verified against analytical solution |
+| Siren PINN + structural params | Full PyTorch implementation with reparameterized parameters |
+| Causal training loop | Two-phase training with physics weight curriculum |
+| ERA baseline | Classical identification for comparison |
+| Experiment suite | 5 reproducible experiments with fixed random seeds |
+| Jupyter notebooks | One per major result, self-contained and executable |
+
+### 8.2 Quantitative Success Criteria
+
+| Metric | Target | Condition |
+|---|---|---|
+| Stiffness identification error | $< 5\%$ | Full sensors, 5% noise |
+| Stiffness identification error | $< 15\%$ | Roof sensor only, 5% noise |
+| Frequency consistency error | $< 2\%$ | Any sensor config |
+| Response NRMSE (instrumented) | $< 5\%$ | Full sensors |
+| Damage localization | Correct floor identified | 30% stiffness reduction |
+| Damage quantification error | $< 10\%$ | 30% stiffness reduction |
+
+### 8.3 Notebook `02_siren_vs_relu` — Pedagogical Result
+
+This notebook compares a standard ReLU MLP against the Siren network on the same structural response signal. It demonstrates spectral bias visually: the ReLU network fails to capture high-frequency modes of the response, while the Siren network captures all frequency content accurately. This is a standalone teaching moment that makes the architectural choice self-evidently justified.
+
+---
+
+## 9. References
+
+**Foundational PINN papers:**
+
+Raissi, M., Perdikaris, P., Karniadakis, G.E. (2019). *Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations.* Journal of Computational Physics, 378, 686–707.
+
+Sitzmann, V., Martel, J., Bergman, A., Lindell, D., Wetzstein, G. (2020). *Implicit neural representations with periodic activation functions.* Advances in Neural Information Processing Systems (NeurIPS), 33.
+
+Wang, S., Yu, X., Perdikaris, P. (2022). *When and why PINNs fail to train: A neural tangent kernel perspective.* Journal of Computational Physics, 449.
+
+Wang, S., Sankaran, S., Perdikaris, P. (2022). *Respecting causality is all you need for training physics-informed neural networks.* arXiv:2203.07404.
+
+Rahaman, N., Baratin, A., Arpit, D., Draxler, F., Lin, M., Hamprecht, F.A., Bengio, Y., Courville, A. (2019). *On the spectral bias of neural networks.* ICML 2019.
+
+**Structural identification and SHM:**
+
+Juang, J.N., Pappa, R.S. (1985). *An eigensystem realization algorithm for modal parameter identification and model reduction.* AIAA Journal of Guidance, Control, and Dynamics, 8(5), 620–627.
+
+Farrar, C.R., Worden, K. (2012). *Structural Health Monitoring: A Machine Learning Perspective.* Wiley.
+
+Brincker, R., Zhang, L., Andersen, P. (2000). *Modal identification from ambient responses using Frequency Domain Decomposition.* IMAC-XVIII.
+
+**PINN for structural dynamics:**
+
+Zhang, E., Yin, M., Karniadakis, G.E. (2020). *Physics-informed neural networks for nonhomogeneous material identification in elasticity imaging.* arXiv:2009.04525.
+
+Lai, Z., Mylonas, C., Nagarajaiah, S., Chatzi, E. (2021). *Structural identification with physics-informed neural ordinary differential equations.* Journal of Sound and Vibration, 508.
+
+**Numerical methods:**
+
+Newmark, N.M. (1959). *A method of computation for structural dynamics.* ASCE Journal of the Engineering Mechanics Division, 85(3), 67–94.
+
+Chopra, A.K. (2017). *Dynamics of Structures: Theory and Applications to Earthquake Engineering*, 5th ed. Pearson.
